@@ -1,6 +1,9 @@
+use std::{ops::Deref, rc::Rc};
+
 use gpui::{
-    canvas, div, point, px, size, Bounds, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Path, Pixels, Point, Render, SharedString, Styled, TextStyle, ViewContext,
+    canvas, div, point, px, size, Bounds, Corners, Edges, Hsla, InteractiveElement, IntoElement,
+    PaintQuad, ParentElement, Path, Pixels, Point, Render, SharedString, Styled, TextStyle,
+    ViewContext,
 };
 
 #[derive(Clone, Debug)]
@@ -13,28 +16,6 @@ pub struct GraphViewer {
     nodes: Vec<Node>,
     start: Point<Pixels>,
     last_pos: Option<Point<Pixels>>,
-}
-
-pub fn draw_rect(bounds: Bounds<Pixels>, rounding: Pixels) -> Path<Pixels> {
-    let start = bounds.bottom_left() - point(px(0.), rounding);
-    let zero = px(0.);
-    let mut path = Path::new(start);
-    let top_left = bounds.bottom_left() - point(zero, bounds.size.height);
-    path.line_to(top_left + point(zero, rounding));
-    path.curve_to(top_left + point(rounding, zero), top_left);
-    path.line_to(bounds.top_right() - point(rounding, zero));
-    path.curve_to(
-        bounds.top_right() + point(zero, rounding),
-        bounds.top_right(),
-    );
-    path.line_to(bounds.bottom_right() - point(zero, rounding));
-    path.curve_to(
-        bounds.bottom_right() - point(rounding, zero),
-        bounds.bottom_right(),
-    );
-    path.line_to(bounds.bottom_left() + point(rounding, zero));
-    path.curve_to(start, bounds.bottom_left());
-    path
 }
 
 impl GraphViewer {
@@ -86,7 +67,8 @@ pub const fn cream() -> Hsla {
 
 impl Render for GraphViewer {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let nodes = self.nodes.clone();
+        let nodes = Rc::new(self.nodes.clone());
+        let nodes_pre = nodes.clone();
         let start = self.start;
         const TEXT_START_OFF: Point<Pixels> = point(px(5.), px(5.));
         const TEXT_HEIGHT: Pixels = px(24.);
@@ -95,20 +77,12 @@ impl Render for GraphViewer {
             .size_full()
             .child(
                 canvas(
-                    move |_bounds, _cx| {},
-                    move |_bounds, _prepaint_data, cx| {
-                        for node in &nodes {
-                            let moved_bounds = Bounds {
-                                origin: node.bounds.origin + start,
-                                ..node.bounds
-                            };
-                            cx.paint_path(draw_rect(moved_bounds, px(5.0)), gpui::black());
-                        }
+                    move |_bounds, cx| {
                         let tx = cx.text_system();
                         let mut sty = TextStyle::default();
                         sty.color = cream();
                         let mut lines_to_draw = vec![];
-                        for node in &nodes {
+                        for node in nodes_pre.deref() {
                             let moved_bounds = Bounds {
                                 origin: node.bounds.origin + start + TEXT_START_OFF,
                                 ..node.bounds
@@ -119,13 +93,26 @@ impl Render for GraphViewer {
                                 &[sty.to_run(node.text.len())],
                                 Some(moved_bounds.size.width),
                             ) else {
-                                return;
+                                continue;
                             };
                             let mut cur_line_orig = moved_bounds.origin;
                             for line in text {
                                 lines_to_draw.push((line, cur_line_orig));
                                 cur_line_orig += point(px(0.), TEXT_HEIGHT + px(2.));
                             }
+                        }
+                        lines_to_draw
+                    },
+                    move |_bounds, lines_to_draw, cx| {
+                        for node in nodes.deref() {
+                            let quad = PaintQuad {
+                                bounds: node.bounds + start,
+                                corner_radii: Corners::all(px(5.)),
+                                background: gpui::black().into(),
+                                border_widths: Edges::all(px(2.)),
+                                border_color: gpui::green(),
+                            };
+                            cx.paint_quad(quad);
                         }
 
                         for (line, offset) in lines_to_draw {
