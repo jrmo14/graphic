@@ -1,9 +1,9 @@
 use std::{ops::Deref, rc::Rc};
 
 use gpui::{
-    canvas, div, point, px, size, Bounds, Corners, Edges, Hsla, InteractiveElement, IntoElement,
-    PaintQuad, ParentElement, Path, Pixels, Point, Render, SharedString, Styled, TextStyle,
-    ViewContext,
+    canvas, div, point, px, quad, radians, size, Bounds, Corners, Edges, Hsla, InteractiveElement,
+    IntoElement, PaintQuad, ParentElement, Path, Pixels, Point, Render, SharedString, Styled,
+    TextStyle, ViewContext,
 };
 
 #[derive(Clone, Debug)]
@@ -12,10 +12,173 @@ struct Node {
     text: SharedString,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum EdgeKind {
+    Take,
+    NoTake,
+    Fallthrough,
+    Switch,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Edge {
+    kind: EdgeKind,
+    start: Point<Pixels>,
+    mid: f32,
+    around: Option<Bounds<Pixels>>,
+    end: Point<Pixels>,
+}
+
 pub struct GraphViewer {
     nodes: Vec<Node>,
+    edges: Vec<Edge>,
     start: Point<Pixels>,
     last_pos: Option<Point<Pixels>>,
+}
+
+/// Generate path to wrap around `points `with `stroke_width`
+/// Assumes that `path `is all right angles
+fn draw_arrows(points: &[Point<Pixels>], stroke_width: Pixels) -> Path<Pixels> {
+    let half_width = stroke_width / 2.;
+    let triangle_size = stroke_width * 1.5;
+
+    let compute_offset = |a: Point<Pixels>, b: Point<Pixels>, c: Point<Pixels>| {
+        if a.x == b.x {
+            // Dealing with a vertical line
+            if a.y < c.y {
+                if a.x < c.x {
+                    // into right turn
+                    point(half_width, -half_width)
+                } else {
+                    // into left turn
+                    point(half_width, half_width)
+                }
+            } else {
+                if a.x < c.x {
+                    // into right turn
+                    point(-half_width, -half_width)
+                } else {
+                    // into left turn
+                    point(-half_width, half_width)
+                }
+            }
+        } else if a.y < c.y {
+            if a.x < c.x {
+                // Turn down and to the right
+                point(half_width, -half_width)
+            } else {
+                // Down and to the left
+                point(half_width, half_width)
+            }
+        } else {
+            if a.x < c.x {
+                // up and to the right
+                point(-half_width, -half_width)
+            } else {
+                // up and to the left
+                point(-half_width, half_width)
+            }
+        }
+    };
+
+    // Start the path
+    let mut path = Path::new(points[0]);
+    path.line_to(points[0] + point(half_width, px(0.)));
+
+    // Trace forward
+    points.windows(3).for_each(|pts| {
+        let offset = compute_offset(pts[0], pts[1], pts[2]);
+        path.line_to(pts[1] + offset);
+    });
+    // Triangle
+    let last = *points.last().unwrap();
+    path.line_to(last + point(half_width, -triangle_size));
+    path.line_to(last + point(half_width + triangle_size, -triangle_size));
+    path.line_to(last);
+    path.line_to(last + point(-half_width + -triangle_size, -triangle_size));
+    path.line_to(last + point(-half_width, -triangle_size));
+    // Trace back
+    points.windows(3).rev().for_each(|pts| {
+        let offset = compute_offset(pts[2] * -1., pts[1] * -1., pts[0] * -1.);
+        path.line_to(pts[1] - offset);
+    });
+    // Close
+    path.line_to(points[0] + point(-half_width, px(0.)));
+
+    path
+}
+
+fn lerp(v0: f32, v1: f32, t: f32) -> f32 {
+    (1. - t) * v0 + t * v1
+}
+
+fn draw_edge(mut edge: Edge, offset: Point<Pixels>, stroke_width: Pixels) -> (Path<Pixels>, Hsla) {
+    let color = match edge.kind {
+        EdgeKind::Take => gpui::green(),
+        EdgeKind::NoTake => gpui::red(),
+        EdgeKind::Fallthrough => gpui::opaque_grey(0.2, 1.),
+        EdgeKind::Switch => gpui::blue(),
+    };
+    edge.start += offset;
+    edge.end += offset;
+    let edge_offset = stroke_width * 10.;
+    let path = if edge.start.y > edge.end.y {
+        let outer_x = if edge.start.x < edge.end.x {
+            if let Some(outer) = edge.around {
+                outer.origin.x - edge_offset
+            } else {
+                edge.start.x - edge_offset
+            }
+        } else {
+            if let Some(outer) = edge.around {
+                outer.origin.x + outer.size.width + edge_offset
+            } else {
+                edge.start.x + edge_offset
+            }
+        } + offset.x;
+        draw_arrows(
+            &[
+                edge.start,
+                edge.start + point(px(0.), edge_offset),
+                point(outer_x, edge.start.y + edge_offset),
+                point(outer_x, edge.end.y - edge_offset),
+                edge.end - point(px(0.), edge_offset),
+                edge.end,
+            ],
+            stroke_width,
+        )
+    } else {
+        draw_arrows(
+            &[
+                edge.start,
+                point(
+                    edge.start.x,
+                    px(lerp(edge.start.y.0, edge.end.y.0, edge.mid)),
+                ),
+                point(edge.end.x, px(lerp(edge.start.y.0, edge.end.y.0, edge.mid))),
+                edge.end,
+            ],
+            stroke_width,
+        )
+    };
+
+    (path, color)
+}
+
+fn create_edge(
+    src: Bounds<Pixels>,
+    sink: Bounds<Pixels>,
+    kind: EdgeKind,
+    mid: f32,
+    around: Option<Bounds<Pixels>>,
+) -> Edge {
+    Edge {
+        kind,
+        start: src.bottom_left() + point(px(src.size.width / px(2.)), px(0.)),
+        end: sink.top_right() - point(px(sink.size.width / px(2.)), px(0.)),
+        mid,
+        around,
+    }
 }
 
 impl GraphViewer {
@@ -43,10 +206,41 @@ impl GraphViewer {
                 text: "inc rax\njmp .LOOP_START".into(),
             },
         ];
+        let edges = vec![
+            create_edge(
+                nodes[0].bounds - point(px(15.), px(0.)),
+                nodes[1].bounds,
+                EdgeKind::Take,
+                0.5,
+                None,
+            ),
+            create_edge(
+                nodes[0].bounds,
+                nodes[2].bounds,
+                EdgeKind::NoTake,
+                0.3,
+                None,
+            ),
+            create_edge(
+                nodes[2].bounds,
+                nodes[0].bounds,
+                EdgeKind::Fallthrough,
+                0.5,
+                Some(nodes[2].bounds),
+            ),
+            create_edge(
+                nodes[1].bounds,
+                nodes[0].bounds - point(px(15.0), px(0.)),
+                EdgeKind::Fallthrough,
+                0.5,
+                Some(nodes[1].bounds),
+            ),
+        ];
 
         Self {
             start: point(px(0.), px(0.)),
             nodes,
+            edges,
             last_pos: None,
         }
     }
@@ -69,9 +263,11 @@ impl Render for GraphViewer {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let nodes = Rc::new(self.nodes.clone());
         let nodes_pre = nodes.clone();
+        let edges = self.edges.clone();
         let start = self.start;
         const TEXT_START_OFF: Point<Pixels> = point(px(5.), px(5.));
-        const TEXT_HEIGHT: Pixels = px(24.);
+        const TEXT_HEIGHT: Pixels = px(18.);
+        const TEXT_SPACING: Pixels = px(2.);
         div()
             .bg(cream())
             .size_full()
@@ -81,7 +277,7 @@ impl Render for GraphViewer {
                         let tx = cx.text_system();
                         let mut sty = TextStyle::default();
                         sty.color = cream();
-                        let mut lines_to_draw = vec![];
+                        let mut text_to_draw = vec![];
                         for node in nodes_pre.deref() {
                             let moved_bounds = Bounds {
                                 origin: node.bounds.origin + start + TEXT_START_OFF,
@@ -97,13 +293,13 @@ impl Render for GraphViewer {
                             };
                             let mut cur_line_orig = moved_bounds.origin;
                             for line in text {
-                                lines_to_draw.push((line, cur_line_orig));
-                                cur_line_orig += point(px(0.), TEXT_HEIGHT + px(2.));
+                                text_to_draw.push((line, cur_line_orig));
+                                cur_line_orig += point(px(0.), TEXT_HEIGHT + TEXT_SPACING);
                             }
                         }
-                        lines_to_draw
+                        text_to_draw
                     },
-                    move |_bounds, lines_to_draw, cx| {
+                    move |_bounds, text_to_draw, cx| {
                         for node in nodes.deref() {
                             let quad = PaintQuad {
                                 bounds: node.bounds + start,
@@ -114,9 +310,13 @@ impl Render for GraphViewer {
                             };
                             cx.paint_quad(quad);
                         }
+                        for edge in edges {
+                            let (path, color) = draw_edge(edge, start, px(3.));
+                            cx.paint_path(path, color);
+                        }
 
-                        for (line, offset) in lines_to_draw {
-                            let _ = line.paint(offset, TEXT_HEIGHT, cx);
+                        for (text, offset) in text_to_draw {
+                            let _ = text.paint(offset, TEXT_HEIGHT, cx);
                         }
                     },
                 )
