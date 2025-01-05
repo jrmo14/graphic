@@ -1,10 +1,13 @@
-use std::{ops::Deref, rc::Rc};
+pub mod layout;
 
 use gpui::{
-    canvas, div, point, px, quad, radians, size, Bounds, Corners, Edges, Hsla, InteractiveElement,
+    canvas, div, point, px, size, Bounds, Corners, Div, Edges, Hsla, InteractiveElement,
     IntoElement, PaintQuad, ParentElement, Path, Pixels, Point, Render, SharedString, Styled,
-    TextStyle, ViewContext,
+    TextStyle, ViewContext, WrappedLine,
 };
+use layout::Radius;
+use petgraph::graph::{DiGraph, NodeIndex};
+use std::{ops::Deref, rc::Rc};
 
 #[derive(Clone, Debug)]
 struct Node {
@@ -12,8 +15,21 @@ struct Node {
     text: SharedString,
 }
 
+impl Radius for Node {
+    fn radius(&self) -> f32 {
+        (self.bounds.size.width.max(self.bounds.size.height) / 2.).0
+    }
+}
+
+pub enum Message {
+    LayoutRequest {
+        graph: DiGraph<Vec<String>, EdgeKind>,
+        entry: NodeIndex,
+    },
+}
+
 #[derive(Copy, Clone, Debug)]
-enum EdgeKind {
+pub enum EdgeKind {
     Take,
     NoTake,
     Fallthrough,
@@ -28,17 +44,21 @@ struct Edge {
     around: Option<Bounds<Pixels>>,
     end: Point<Pixels>,
 }
-
-pub struct GraphViewer {
+struct LayoutData {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+}
+
+pub struct GraphViewer {
     start: Point<Pixels>,
     last_pos: Option<Point<Pixels>>,
+    layout_data: Option<LayoutData>,
+    pending_message: Option<Message>,
 }
 
 /// Generate path to wrap around `points `with `stroke_width`
-/// Assumes that `path `is all right angles
-fn draw_arrows(points: &[Point<Pixels>], stroke_width: Pixels) -> Path<Pixels> {
+/// Assumes that `path` is all right angles
+fn draw_arrow(points: &[Point<Pixels>], stroke_width: Pixels) -> Path<Pixels> {
     let half_width = stroke_width / 2.;
     let triangle_size = stroke_width * 1.5;
 
@@ -53,14 +73,12 @@ fn draw_arrows(points: &[Point<Pixels>], stroke_width: Pixels) -> Path<Pixels> {
                     // into left turn
                     point(half_width, half_width)
                 }
+            } else if a.x < c.x {
+                // into right turn
+                point(-half_width, -half_width)
             } else {
-                if a.x < c.x {
-                    // into right turn
-                    point(-half_width, -half_width)
-                } else {
-                    // into left turn
-                    point(-half_width, half_width)
-                }
+                // into left turn
+                point(-half_width, half_width)
             }
         } else if a.y < c.y {
             if a.x < c.x {
@@ -70,14 +88,12 @@ fn draw_arrows(points: &[Point<Pixels>], stroke_width: Pixels) -> Path<Pixels> {
                 // Down and to the left
                 point(half_width, half_width)
             }
+        } else if a.x < c.x {
+            // up and to the right
+            point(-half_width, -half_width)
         } else {
-            if a.x < c.x {
-                // up and to the right
-                point(-half_width, -half_width)
-            } else {
-                // up and to the left
-                point(-half_width, half_width)
-            }
+            // up and to the left
+            point(-half_width, half_width)
         }
     };
 
@@ -129,14 +145,12 @@ fn draw_edge(mut edge: Edge, offset: Point<Pixels>, stroke_width: Pixels) -> (Pa
             } else {
                 edge.start.x - edge_offset
             }
+        } else if let Some(outer) = edge.around {
+            outer.origin.x + outer.size.width + edge_offset
         } else {
-            if let Some(outer) = edge.around {
-                outer.origin.x + outer.size.width + edge_offset
-            } else {
-                edge.start.x + edge_offset
-            }
+            edge.start.x + edge_offset
         } + offset.x;
-        draw_arrows(
+        draw_arrow(
             &[
                 edge.start,
                 edge.start + point(px(0.), edge_offset),
@@ -148,7 +162,7 @@ fn draw_edge(mut edge: Edge, offset: Point<Pixels>, stroke_width: Pixels) -> (Pa
             stroke_width,
         )
     } else {
-        draw_arrows(
+        draw_arrow(
             &[
                 edge.start,
                 point(
@@ -180,6 +194,11 @@ fn create_edge(
         around,
     }
 }
+
+type PrepaintData = Vec<(WrappedLine, Point<Pixels>)>;
+const TEXT_START_OFF: Point<Pixels> = point(px(5.), px(5.));
+const TEXT_HEIGHT: Pixels = px(18.);
+const TEXT_SPACING: Pixels = px(2.);
 
 impl GraphViewer {
     pub fn new() -> Self {
@@ -239,14 +258,37 @@ impl GraphViewer {
 
         Self {
             start: point(px(0.), px(0.)),
-            nodes,
-            edges,
+            layout_data: Some(LayoutData { nodes, edges }),
+            // layout_data: None,
             last_pos: None,
+            pending_message: None,
         }
     }
 
     pub fn clear(&mut self, cx: &mut ViewContext<Self>) {
         cx.notify();
+    }
+
+    pub fn handle_message(&mut self, message: Message) {
+        match message {
+            Message::LayoutRequest { .. } => self.pending_message.replace(message),
+        };
+    }
+
+    pub fn paint_no_data(&mut self, _cx: &mut ViewContext<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .bg(cream())
+            .size_full()
+            .justify_center()
+            .items_center()
+            .shadow_lg()
+            .border_1()
+            .text_xl()
+            .text_color(gpui::black())
+            .child(format!("No graph to display"))
     }
 }
 
@@ -261,22 +303,24 @@ pub const fn cream() -> Hsla {
 
 impl Render for GraphViewer {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let nodes = Rc::new(self.nodes.clone());
+        let Some(layout_data) = &self.layout_data else {
+            return self.paint_no_data(cx);
+        };
+        let nodes = Rc::new(layout_data.nodes.clone());
         let nodes_pre = nodes.clone();
-        let edges = self.edges.clone();
+        let edges = layout_data.edges.clone();
         let start = self.start;
-        const TEXT_START_OFF: Point<Pixels> = point(px(5.), px(5.));
-        const TEXT_HEIGHT: Pixels = px(18.);
-        const TEXT_SPACING: Pixels = px(2.);
         div()
             .bg(cream())
             .size_full()
             .child(
                 canvas(
-                    move |_bounds, cx| {
+                    move |_bounds, cx| -> PrepaintData {
                         let tx = cx.text_system();
-                        let mut sty = TextStyle::default();
-                        sty.color = cream();
+                        let sty = TextStyle {
+                            color: cream(),
+                            ..Default::default()
+                        };
                         let mut text_to_draw = vec![];
                         for node in nodes_pre.deref() {
                             let moved_bounds = Bounds {
@@ -325,6 +369,9 @@ impl Render for GraphViewer {
             .on_mouse_down(
                 gpui::MouseButton::Middle,
                 cx.listener(|this, ev: &gpui::MouseDownEvent, _| {
+                    if this.last_pos.is_some() {
+                        return;
+                    }
                     this.last_pos.replace(ev.position);
                 }),
             )
@@ -339,6 +386,38 @@ impl Render for GraphViewer {
                     this.last_pos = None;
                 }),
             )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, _| {
+                    if this.last_pos.is_some() || !ev.modifiers.control {
+                        return;
+                    }
+                    this.last_pos.replace(ev.position);
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, ev: &gpui::MouseUpEvent, _| {
+                    let Some(last_pos) = this.last_pos else {
+                        return;
+                    };
+                    let delta = ev.position - last_pos;
+                    this.start += delta;
+                    this.last_pos = None;
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, cx| {
+                println!("Scroll!!!");
+                if this.last_pos.is_some() {
+                    return;
+                }
+                let delta = match ev.delta {
+                    gpui::ScrollDelta::Pixels(p) => p,
+                    gpui::ScrollDelta::Lines(p) => point(px(p.x * -10.), px(p.y * -10.)),
+                };
+                this.start += delta;
+                cx.notify();
+            }))
             .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, cx| {
                 let Some(drag_start) = this.last_pos else {
                     return;

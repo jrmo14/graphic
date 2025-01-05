@@ -1,5 +1,8 @@
-use gpui::{div, prelude::*, App, AppContext, Render, View, ViewContext, WindowOptions};
-use graphic::GraphViewer;
+use gpui::{
+    div, prelude::*, App, AppContext, Context, ModelContext, Render, View, ViewContext,
+    WindowOptions,
+};
+use graphic::{layout::GraphLayout, GraphViewer};
 struct Grphic {
     graph_viewer: View<GraphViewer>,
 }

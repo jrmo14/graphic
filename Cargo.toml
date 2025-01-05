@@ -4,4 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+fjadra = "0.2.1"
 gpui = {git = "https://github.com/zed-industries/zed.git"}
+petgraph = {git = "https://github.com/petgraph/petgraph.git"}
