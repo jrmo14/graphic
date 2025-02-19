@@ -3,11 +3,10 @@ pub mod layout;
 use gpui::{
     canvas, div, point, px, size, Bounds, Corners, Div, Edges, Hsla, InteractiveElement,
     IntoElement, PaintQuad, ParentElement, Path, Pixels, Point, Render, SharedString, Styled,
-    TextStyle, ViewContext, WrappedLine,
+    TextStyle, ViewContext, WindowContext, WrappedLine,
 };
-use layout::Radius;
+use layout::{GraphLayout, Radius};
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::{ops::Deref, rc::Rc};
 
 #[derive(Clone, Debug)]
 struct Node {
@@ -44,6 +43,8 @@ struct Edge {
     around: Option<Bounds<Pixels>>,
     end: Point<Pixels>,
 }
+
+#[derive(Clone, Debug)]
 struct LayoutData {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
@@ -290,6 +291,52 @@ impl GraphViewer {
             .text_color(gpui::black())
             .child(format!("No graph to display"))
     }
+
+    // TODO might be fun to animate the canvas with simulation data
+    fn prepaint(
+        &mut self,
+    ) -> impl 'static + FnOnce(Bounds<Pixels>, &mut WindowContext) -> PrepaintData {
+        let start = self.start;
+        // Take here because we want to move and clear the message
+        // let pending_message = self.pending_message.take();
+
+        // Unwrap safety... we won't be painting to the canvas if we don't have layout data
+        let layout_data = self.layout_data.clone();
+        // TODO need to layout text on top of itself to determine the size of the nodes
+        // Use that to create boxes, emit node and edge locations like that
+        // If there is a pending message, then we need to use that to update the layout
+        // We should also change the prepaint data to return the layout info
+        // Sould also make sure to only draw items that are contained within the boundary of the view
+        move |_bounds, cx| -> PrepaintData {
+            let nodes = layout_data.unwrap().nodes;
+            let tx = cx.text_system();
+            let sty = TextStyle {
+                color: cream(),
+                ..Default::default()
+            };
+            let mut text_to_draw = vec![];
+            for node in nodes {
+                let moved_bounds = Bounds {
+                    origin: node.bounds.origin + start + TEXT_START_OFF,
+                    ..node.bounds
+                };
+                let Ok(text) = tx.shape_text(
+                    node.text.clone(),
+                    TEXT_HEIGHT,
+                    &[sty.to_run(node.text.len())],
+                    Some(moved_bounds.size.width),
+                ) else {
+                    continue;
+                };
+                let mut cur_line_orig = moved_bounds.origin;
+                for line in text {
+                    text_to_draw.push((line, cur_line_orig));
+                    cur_line_orig += point(px(0.), TEXT_HEIGHT + TEXT_SPACING);
+                }
+            }
+            text_to_draw
+        }
+    }
 }
 
 pub const fn cream() -> Hsla {
@@ -306,64 +353,33 @@ impl Render for GraphViewer {
         let Some(layout_data) = &self.layout_data else {
             return self.paint_no_data(cx);
         };
-        let nodes = Rc::new(layout_data.nodes.clone());
-        let nodes_pre = nodes.clone();
+        let nodes = layout_data.nodes.clone();
         let edges = layout_data.edges.clone();
         let start = self.start;
         div()
             .bg(cream())
             .size_full()
             .child(
-                canvas(
-                    move |_bounds, cx| -> PrepaintData {
-                        let tx = cx.text_system();
-                        let sty = TextStyle {
-                            color: cream(),
-                            ..Default::default()
+                canvas(self.prepaint(), move |_bounds, text_to_draw, cx| {
+                    for node in nodes {
+                        let quad = PaintQuad {
+                            bounds: node.bounds + start,
+                            corner_radii: Corners::all(px(5.)),
+                            background: gpui::black().into(),
+                            border_widths: Edges::all(px(2.)),
+                            border_color: gpui::green(),
                         };
-                        let mut text_to_draw = vec![];
-                        for node in nodes_pre.deref() {
-                            let moved_bounds = Bounds {
-                                origin: node.bounds.origin + start + TEXT_START_OFF,
-                                ..node.bounds
-                            };
-                            let Ok(text) = tx.shape_text(
-                                node.text.clone(),
-                                TEXT_HEIGHT,
-                                &[sty.to_run(node.text.len())],
-                                Some(moved_bounds.size.width),
-                            ) else {
-                                continue;
-                            };
-                            let mut cur_line_orig = moved_bounds.origin;
-                            for line in text {
-                                text_to_draw.push((line, cur_line_orig));
-                                cur_line_orig += point(px(0.), TEXT_HEIGHT + TEXT_SPACING);
-                            }
-                        }
-                        text_to_draw
-                    },
-                    move |_bounds, text_to_draw, cx| {
-                        for node in nodes.deref() {
-                            let quad = PaintQuad {
-                                bounds: node.bounds + start,
-                                corner_radii: Corners::all(px(5.)),
-                                background: gpui::black().into(),
-                                border_widths: Edges::all(px(2.)),
-                                border_color: gpui::green(),
-                            };
-                            cx.paint_quad(quad);
-                        }
-                        for edge in edges {
-                            let (path, color) = draw_edge(edge, start, px(3.));
-                            cx.paint_path(path, color);
-                        }
+                        cx.paint_quad(quad);
+                    }
+                    for edge in edges {
+                        let (path, color) = draw_edge(edge, start, px(3.));
+                        cx.paint_path(path, color);
+                    }
 
-                        for (text, offset) in text_to_draw {
-                            let _ = text.paint(offset, TEXT_HEIGHT, cx);
-                        }
-                    },
-                )
+                    for (text, offset) in text_to_draw {
+                        let _ = text.paint(offset, TEXT_HEIGHT, cx);
+                    }
+                })
                 .size_full(),
             )
             .on_mouse_down(
@@ -407,7 +423,6 @@ impl Render for GraphViewer {
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, cx| {
-                println!("Scroll!!!");
                 if this.last_pos.is_some() {
                     return;
                 }
